@@ -45,14 +45,13 @@
 //
 
 #include <algorithm>
+#include <barrier>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -101,34 +100,14 @@ static std::size_t compute_shift_rows(std::size_t n) {
 }
 
 
-// Reusable centralized barrier built from a mutex and a condition variable
-// (generation-counter barrier). Only primitives covered in the course are
-// used. arrive_and_wait() blocks until all participating threads have arrived.
-class Barrier {
-public:
-    explicit Barrier(unsigned participants)
-        : total_(participants), count_(participants), generation_(0) {}
+// Synchronization uses std::barrier (C++20), which is reusable across the
+// iterative loop's two barrier points per iteration.
 
-    void arrive_and_wait() {
-        std::unique_lock<std::mutex> lk(m_);
-        const std::uint64_t gen = generation_;
-        if (--count_ == 0) {
-            // Last thread to arrive: open a new generation and wake the others.
-            ++generation_;
-            count_ = total_;
-            cv_.notify_all();
-        } else {
-            // Predicate-based wait protects against spurious wake-ups.
-            cv_.wait(lk, [this, gen] { return gen != generation_; });
-        }
-    }
-
-private:
-    std::mutex m_;
-    std::condition_variable cv_;
-    unsigned total_;
-    unsigned count_;
-    std::uint64_t generation_;
+// Cache-line-padded double: each worker's reduction slot lives on its own
+// 64-byte cache line, so the per-iteration writes to partial[tid] do not
+// invalidate neighbouring slots in other cores' caches (false sharing).
+struct alignas(64) PaddedDouble {
+    double v = 0.0;
 };
 
 
@@ -186,9 +165,9 @@ static void worker_body(unsigned tid,
                         std::size_t s1,
                         std::vector<double>& buf0,
                         std::vector<double>& buf1,
-                        std::vector<double>& partial,
-                        std::vector<double>& partial_dot,
-                        Barrier& bar,
+                        std::vector<PaddedDouble>& partial,
+                        std::vector<PaddedDouble>& partial_dot,
+                        std::barrier<>& sync,
                         double& rayleigh_out) {
     const std::size_t n = A.n;
     const std::uint64_t* rp = A.row_ptr.data();
@@ -225,17 +204,17 @@ static void worker_body(unsigned tid,
             yw[out] = sum;
             local_ss += sum * sum;
         }
-        partial[tid] = local_ss;
+        partial[tid].v = local_ss;
 
         // Global reduction point: every worker waits for all partial sums.
-        bar.arrive_and_wait();
+        sync.arrive_and_wait();
 
         // Each worker reduces the partial sums in the same fixed order, so the
         // resulting inverse norm is identical across workers (no need to
         // publish a shared value).
         double total = 0.0;
         for (unsigned k = 0; k < P; ++k) {
-            total += partial[k];
+            total += partial[k].v;
         }
         const double inv = 1.0 / std::sqrt(total);
 
@@ -247,7 +226,7 @@ static void worker_body(unsigned tid,
 
         // End-of-iteration barrier: the written buffer becomes the read buffer
         // of the next iteration, so all writes must be visible first.
-        bar.arrive_and_wait();
+        sync.arrive_and_wait();
     }
 
     // Final diagnostics, inside the timed region as in the sequential code.
@@ -269,14 +248,14 @@ static void worker_body(unsigned tid,
         ye[out] = sum;
         local_dot += xf[out] * sum;   // contribution to dot(x, y)
     }
-    partial_dot[tid] = local_dot;
+    partial_dot[tid].v = local_dot;
 
     // Combine the Rayleigh-like value (rayleigh = dot(x, y)).
-    bar.arrive_and_wait();
+    sync.arrive_and_wait();
     if (tid == 0) {
         double total = 0.0;
         for (unsigned k = 0; k < P; ++k) {
-            total += partial_dot[k];
+            total += partial_dot[k].v;
         }
         rayleigh_out = total;
     }
@@ -308,9 +287,9 @@ static IterativeResult iterative_spmv_evolving_threads(const CSRMatrix& A,
 
     const std::vector<std::size_t> boundary = nnz_balanced_partition(A, P);
 
-    std::vector<double> partial(P, 0.0);
-    std::vector<double> partial_dot(P, 0.0);
-    Barrier bar(P);
+    std::vector<PaddedDouble> partial(P);
+    std::vector<PaddedDouble> partial_dot(P);
+    std::barrier<> sync(P);
     double rayleigh = 0.0;
 
     // Phase 2 + 3: spawn the persistent workers for the whole iterative loop
@@ -323,7 +302,7 @@ static IterativeResult iterative_spmv_evolving_threads(const CSRMatrix& A,
                              boundary[t], boundary[t + 1],
                              std::ref(buf0), std::ref(buf1),
                              std::ref(partial), std::ref(partial_dot),
-                             std::ref(bar), std::ref(rayleigh));
+                             std::ref(sync), std::ref(rayleigh));
     }
     for (std::thread& th : threads) {
         th.join();
