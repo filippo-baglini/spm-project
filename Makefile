@@ -29,5 +29,9 @@ seq: iterative_SpMV.cpp $(HEADERS)
 threads: iterative_SpMV_threads.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) -pthread iterative_SpMV_threads.cpp -o $@
 
+# Frozen pre-optimization version, for benchmarking against 'threads'.
+threads_baseline: iterative_SpMV_threads_baseline.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -pthread iterative_SpMV_threads_baseline.cpp -o $@
+
 clean:
 	$(RM) $(BINARIES)

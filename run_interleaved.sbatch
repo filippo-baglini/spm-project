@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
-#SBATCH --time=01:30:00
+#SBATCH --time=00:30:00
 #SBATCH --output=results_interleaved_%j.log
 #SBATCH --error=errors_interleaved_%j.log
 
@@ -17,11 +17,12 @@
 # always measured a second apart, they share the same machine state, so the
 # median ratio is a trustworthy verdict.
 #
-# Both binaries are rebuilt from git so the comparison is reproducible:
-#   - baseline  : git tag 'baseline'  (mutex+CV barrier, unpadded slots)
-#   - optimized : git tag 'optimized' (cache-line padding + std::barrier)
-# Override the sources with BASELINE_SRC / OPT_SRC env vars if git is not
-# available on this machine (e.g. point them at local .cpp copies).
+# Both threaded versions live as separate source files in the repo, so this
+# works on any machine WITHOUT needing the git history (just copy the project
+# files over):
+#   - baseline : iterative_SpMV_threads_baseline.cpp (mutex+CV barrier, unpadded)
+#   - optimized: iterative_SpMV_threads.cpp          (padding + std::barrier)
+# Override with BASELINE_SRC / OPT_SRC env vars to point at other .cpp files.
 
 RESULTS_DIR="results_interleaved"
 REPS=3                                  # repetitions per cell (3-5 recommended)
@@ -44,31 +45,18 @@ echo "=== Building binaries ==="
 # Sequential reference (unchanged across versions -> use working tree).
 g++ $CXXFLAGS -I . iterative_SpMV.cpp -o "$BUILD/seq_ref"
 
-# Resolve baseline / optimized threaded sources.
-BASELINE_SRC="${BASELINE_SRC:-}"
-OPT_SRC="${OPT_SRC:-}"
+# Resolve baseline / optimized threaded sources (plain files; no git needed).
+BASELINE_SRC="${BASELINE_SRC:-iterative_SpMV_threads_baseline.cpp}"
+OPT_SRC="${OPT_SRC:-iterative_SpMV_threads.cpp}"
 
-if [ -z "$BASELINE_SRC" ]; then
-    if git rev-parse --verify -q baseline >/dev/null; then
-        git show baseline:iterative_SpMV_threads.cpp > "$BUILD/threads_base.cpp"
-        BASELINE_SRC="$BUILD/threads_base.cpp"
-    else
-        echo "ERROR: git tag 'baseline' not found and BASELINE_SRC not set." >&2
-        echo "  Sync the repo (including .git) to this machine, or set" >&2
-        echo "  BASELINE_SRC=/path/to/old_iterative_SpMV_threads.cpp" >&2
+for src in "$BASELINE_SRC" "$OPT_SRC"; do
+    if [ ! -f "$src" ]; then
+        echo "ERROR: source file not found: $src" >&2
+        echo "  Expected both threaded versions in the project dir, or set" >&2
+        echo "  BASELINE_SRC / OPT_SRC to valid .cpp paths." >&2
         exit 1
     fi
-fi
-
-if [ -z "$OPT_SRC" ]; then
-    if git rev-parse --verify -q optimized >/dev/null; then
-        git show optimized:iterative_SpMV_threads.cpp > "$BUILD/threads_opt.cpp"
-        OPT_SRC="$BUILD/threads_opt.cpp"
-    else
-        # Fall back to the current working tree (assumed optimized).
-        OPT_SRC="iterative_SpMV_threads.cpp"
-    fi
-fi
+done
 
 echo "baseline source : $BASELINE_SRC"
 echo "optimized source: $OPT_SRC"
