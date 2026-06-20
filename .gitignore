@@ -14,8 +14,7 @@
 *.log
 
 # Benchmark output data (regenerable, can be large)
-results/
-results_optimized/
+results*/
 *.dump
 
 # Reference PDFs (assignment spec & course notes)
