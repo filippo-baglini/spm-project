@@ -1,0 +1,22 @@
+# Compiled binaries
+/seq
+/threads
+/seq_spmv
+/thread_spmv
+/threads_baseline
+*.o
+*.out
+
+# Python virtualenv (used only for PDF text extraction)
+.venv_pdf/
+
+# SLURM / run logs
+*.log
+
+# Benchmark output data (regenerable, can be large)
+results/
+results_optimized/
+*.dump
+
+# Reference PDFs (assignment spec & course notes)
+*.pdf
