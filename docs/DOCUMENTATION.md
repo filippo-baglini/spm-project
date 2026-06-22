@@ -246,10 +246,13 @@ To stay comparable with the sequential baseline, the timer wraps exactly what th
 
 ## 7. `Makefile`
 
-- `make` / `make all` — builds both `seq` and `threads`.
-- `make seq`, `make threads` — build individually.
-- `make clean` — remove the executables.
+The repository is organized as `include/` (provided helpers), `src/{sequential,threads,openmp}/` (implementations), `scripts/` (sbatch + analysis), `docs/`. The Makefile builds into `bin/` (gitignored).
 
-Optimization flags: `-O3 -march=native -funroll-loops -DNDEBUG`, `-std=c++20`, `-Wall -Wextra`; the threaded target adds `-pthread`. Both targets depend on `matrix_generation.hpp` and `utils.hpp`, so a header change triggers a rebuild.
+- `make` / `make all` — builds `seq`, `threads` and `omp`.
+- `make seq`, `make threads`, `make omp` — build individually (outputs `bin/seq`, `bin/threads`, `bin/omp`).
+- `make threads_AB`, `make threads_baseline` — frozen comparison versions.
+- `make clean` — remove the `bin/` directory.
+
+Optimization flags: `-O3 -march=native -funroll-loops -DNDEBUG`, `-std=c++20`, `-Wall -Wextra`, `-I include`; the threaded target adds `-pthread`, the OpenMP target adds `-pthread -fopenmp`. All targets depend on `include/matrix_generation.hpp` and `include/utils.hpp`, so a header change triggers a rebuild.
 
 > **Portability caveat:** `-march=native` tunes for the *compiling* machine's CPU. Compile on the same node type you run on (e.g. directly on the cluster node); otherwise replace it with `-mtune=native` or drop it to avoid illegal-instruction faults on a different micro-architecture.

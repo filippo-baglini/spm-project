@@ -13,27 +13,21 @@
 
 set -e
 
+# Run from the project root so src/... paths and the output dir resolve.
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+
 # Compile options
 CXXFLAGS="-O3 -std=c++20 -Wall -pthread"
-INCLUDES="-I ."
+INCLUDES="-I include"
 
 echo "=== Building Sequential Version ==="
-g++ $CXXFLAGS $INCLUDES -o seq_spmv iterative_SpMV.cpp
+g++ $CXXFLAGS $INCLUDES -o seq_spmv src/sequential/iterative_SpMV.cpp
 echo "Sequential binary: seq_spmv"
 
 echo ""
 echo "=== Building Threaded Version ==="
-# Build from iterative_SpMV_threads.cpp if it exists, otherwise use Makefile
-if [ -f iterative_SpMV_threads.cpp ]; then
-  g++ $CXXFLAGS $INCLUDES -o thread_spmv iterative_SpMV_threads.cpp
-  echo "Threaded binary: thread_spmv"
-elif [ -f Makefile ]; then
-  make thread_spmv || make
-  echo "Built using Makefile"
-else
-  echo "Error: neither iterative_SpMV_threads.cpp nor Makefile found"
-  exit 1
-fi
+g++ $CXXFLAGS $INCLUDES -o thread_spmv src/threads/iterative_SpMV_threads.cpp
+echo "Threaded binary: thread_spmv"
 
 echo ""
 echo "=== Test Configuration ==="

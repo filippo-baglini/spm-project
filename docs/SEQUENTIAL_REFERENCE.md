@@ -353,14 +353,18 @@ Rayleigh value and a strict bitwise checksum.
 ## 9. Build and run
 
 ```bash
-g++ -O3 -std=c++20 -I . -Wall iterative_SpMV.cpp -o seq
+# Via the Makefile (builds into bin/):
+make seq
+
+# Or directly:
+g++ -O3 -std=c++20 -I include -Wall src/sequential/iterative_SpMV.cpp -o bin/seq
 
 # small run with a vector dump for inspection
-./seq -n 5000 -nz 20000 -m irregular --dump-vector seq_vec.dump
+./bin/seq -n 5000 -nz 20000 -m irregular --dump-vector seq_vec.dump
 
 # the real workloads
-./seq -n 500000 -nz 20000000 -m irregular
-./seq -n 500000 -nz 20000000 -m regular
+./bin/seq -n 500000 -nz 20000000 -m irregular
+./bin/seq -n 500000 -nz 20000000 -m regular
 ```
 
 The `checksum=` line is the value any parallel version must reproduce for the same arguments.

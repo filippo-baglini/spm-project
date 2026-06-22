@@ -24,6 +24,9 @@
 #   - optimized: iterative_SpMV_threads.cpp          (padding + std::barrier)
 # Override with BASELINE_SRC / OPT_SRC env vars to point at other .cpp files.
 
+# Run from the project root so src/... paths and the output dir resolve.
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}" || exit 1
+
 RESULTS_DIR="results_interleaved"
 REPS=3                                  # repetitions per cell (3-5 recommended)
 MATRIX_SIZES="100000 500000"
@@ -43,11 +46,11 @@ mkdir -p "$BUILD" "$RAW"
 echo "=== Building binaries ==="
 
 # Sequential reference (unchanged across versions -> use working tree).
-g++ $CXXFLAGS -I . iterative_SpMV.cpp -o "$BUILD/seq_ref"
+g++ $CXXFLAGS -I include src/sequential/iterative_SpMV.cpp -o "$BUILD/seq_ref"
 
 # Resolve baseline / optimized threaded sources (plain files; no git needed).
-BASELINE_SRC="${BASELINE_SRC:-iterative_SpMV_threads_baseline.cpp}"
-OPT_SRC="${OPT_SRC:-iterative_SpMV_threads.cpp}"
+BASELINE_SRC="${BASELINE_SRC:-src/threads/iterative_SpMV_threads_baseline.cpp}"
+OPT_SRC="${OPT_SRC:-src/threads/iterative_SpMV_threads.cpp}"
 
 for src in "$BASELINE_SRC" "$OPT_SRC"; do
     if [ ! -f "$src" ]; then
@@ -60,8 +63,8 @@ done
 
 echo "baseline source : $BASELINE_SRC"
 echo "optimized source: $OPT_SRC"
-g++ $CXXFLAGS -I . "$BASELINE_SRC" -o "$BUILD/threads_base"
-g++ $CXXFLAGS -I . "$OPT_SRC"      -o "$BUILD/threads_opt"
+g++ $CXXFLAGS -I include "$BASELINE_SRC" -o "$BUILD/threads_base"
+g++ $CXXFLAGS -I include "$OPT_SRC"      -o "$BUILD/threads_opt"
 
 SEQ="$BUILD/seq_ref"
 BASE="$BUILD/threads_base"

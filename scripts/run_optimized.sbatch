@@ -19,20 +19,23 @@
 
 set -e
 
+# Run from the project root so src/... paths and the output dir resolve.
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+
 # Output directory for this (new) run. Change here if you want another name.
 RESULTS_DIR="results_optimized"
 
 # Compile options (match the Makefile / baseline run).
 CXXFLAGS="-O3 -march=native -funroll-loops -std=c++20 -Wall -Wextra -pthread"
-INCLUDES="-I ."
+INCLUDES="-I include"
 
 echo "=== Building Sequential Reference ==="
-g++ $CXXFLAGS $INCLUDES -o seq_spmv iterative_SpMV.cpp
+g++ $CXXFLAGS $INCLUDES -o seq_spmv src/sequential/iterative_SpMV.cpp
 echo "Sequential binary: seq_spmv"
 
 echo ""
 echo "=== Building Optimized Threaded Version ==="
-g++ $CXXFLAGS $INCLUDES -o thread_spmv iterative_SpMV_threads.cpp
+g++ $CXXFLAGS $INCLUDES -o thread_spmv src/threads/iterative_SpMV_threads.cpp
 echo "Threaded binary: thread_spmv"
 
 echo ""

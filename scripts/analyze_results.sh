@@ -2,6 +2,10 @@
 # Analyze SpMV benchmark results using standard Unix tools
 # No Python required - works on any cluster
 
+# Run from the project root so a relative results dir resolves against the
+# project, not the scripts/ folder.
+cd "$(dirname "$0")/.." || exit 1
+
 results_dir="results"
 
 compare_dumps() {

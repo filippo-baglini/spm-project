@@ -1,10 +1,5 @@
-# Compiled binaries
-/seq
-/threads
-/seq_spmv
-/thread_spmv
-/threads_baseline
-/threads_AB
+# Compiled binaries (Makefile builds into bin/)
+/bin/
 *.o
 *.out
 

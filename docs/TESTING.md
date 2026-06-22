@@ -17,7 +17,8 @@ This directory contains tools to build and compare the sequential and threaded v
 
 ### 1. Submit the batch job
 ```bash
-sbatch run_comparison.sbatch
+# Submit from the project root; the script cd's to $SLURM_SUBMIT_DIR.
+sbatch scripts/run_comparison.sbatch
 ```
 
 This will:
@@ -33,7 +34,7 @@ squeue -u $USER
 
 ### 3. Analyze results
 ```bash
-./analyze_results.sh
+./scripts/analyze_results.sh
 ```
 
 This generates:
@@ -145,7 +146,7 @@ grep "Time (sec)" results/*.txt
 grep "checksum=" results/*.txt
 
 # Run analysis script again
-./analyze_results.sh
+./scripts/analyze_results.sh
 ```
 
 ## Notes

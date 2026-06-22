@@ -15,6 +15,10 @@
 # A "DIFF" in the checksum column therefore signals a real problem, not just
 # floating-point reordering.
 
+# Run from the project root so relative results dirs resolve against the
+# project, not the scripts/ folder.
+cd "$(dirname "$0")/.." || exit 1
+
 old_dir="${1:-results}"
 new_dir="${2:-results_optimized}"
 
