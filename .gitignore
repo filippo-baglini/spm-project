@@ -4,6 +4,7 @@
 /seq_spmv
 /thread_spmv
 /threads_baseline
+/threads_AB
 *.o
 *.out
 
@@ -19,3 +20,6 @@ results*/
 
 # Reference PDFs (assignment spec & course notes)
 *.pdf
+
+# Course example code (professor-provided reference, not part of the deliverable)
+Code/

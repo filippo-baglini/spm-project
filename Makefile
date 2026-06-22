@@ -33,5 +33,11 @@ threads: iterative_SpMV_threads.cpp $(HEADERS)
 threads_baseline: iterative_SpMV_threads_baseline.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) -pthread iterative_SpMV_threads_baseline.cpp -o $@
 
+# Frozen A+B snapshot (padding + std::barrier only), to attribute the gains of
+# the later C/D/E optimizations (affinity, __restrict__, barrier completion fn).
+# Benchmark with: BASELINE_SRC=iterative_SpMV_threads_AB.cpp sbatch run_interleaved.sbatch
+threads_AB: iterative_SpMV_threads_AB.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -pthread iterative_SpMV_threads_AB.cpp -o $@
+
 clean:
-	$(RM) $(BINARIES)
+	$(RM) $(BINARIES) threads_baseline threads_AB

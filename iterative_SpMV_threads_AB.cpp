@@ -1,3 +1,12 @@
+// ===========================================================================
+// FROZEN A+B SNAPSHOT — kept only for benchmark attribution.
+//
+// This is the optimized threaded SpMV with optimizations A (false-sharing
+// padding) and B (std::barrier) ONLY, captured before C/D/E (affinity,
+// __restrict__, barrier completion function) were added to
+// iterative_SpMV_threads.cpp. Use it as BASELINE_SRC in run_interleaved.sbatch
+// to isolate the contribution of C/D/E. Do NOT develop here.
+// ===========================================================================
 //
 // C++ threads implementation for the One-Shot project:
 //
@@ -21,21 +30,11 @@
 //     output index mapping, with no data movement and no repartitioning.
 //   * Per iteration the computation is a Map (shifted SpMV) + a global
 //     reduction (L2 norm) + a Map (scaling). The partial sum-of-squares is
-//     fused into the SpMV map. A C++20 std::barrier provides the two
-//     synchronization points per iteration; its completion function performs
-//     the norm reduction once and publishes the inverse norm to all workers.
+//     fused into the SpMV map. A reusable mutex + condition_variable barrier
+//     provides the two synchronization points per iteration.
 //   * Two ping-pong buffers replace the explicit x/y swap, so no serial
 //     section is needed inside the loop (the logical row shift is derived
 //     locally by each worker from the iteration index).
-//
-// Optimizations grounded in SPM NOTES / the course example code (Code/):
-//   A  false-sharing padding of the reduction slots (PaddedDouble).
-//   B  std::barrier instead of a hand-rolled mutex+condition_variable barrier.
-//   C  thread affinity: each worker is pinned to a fixed logical CPU. The
-//      default policy is compact (core == tid); set the AFFINITY environment
-//      variable to a CPU list (e.g. "0,2,4-10:2") to override it.
-//   D  __restrict__ on the CSR arrays and ping-pong buffers (no aliasing).
-//   E  the std::barrier completion function reduces the norm once per iteration.
 //
 // Command line (superset of the sequential reference):
 //   -n  N        matrix size, NxN
@@ -60,92 +59,17 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#if defined(__linux__)
-#include <pthread.h>
-#include <sched.h>
-#endif
-
 #include "matrix_generation.hpp"
 #include "utils.hpp"
-
-
-// Optimization C: thread affinity / pinning (SPM NOTES p.95, p.130; course
-// example Code/spmcode7). Pinning each worker to a fixed logical CPU stops the
-// scheduler from migrating it and keeps it on the NUMA node that first-touched
-// its data, which is the dominant cost on this memory-bound kernel at high
-// thread counts.
-
-// Best-effort pin of the calling thread to a single logical CPU. A no-op on
-// non-Linux platforms or if the syscall is rejected (e.g. CPU not in cpuset).
-#if defined(__linux__)
-static void pin_to_core(unsigned core) {
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(core, &set);
-    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-}
-#else
-static void pin_to_core(unsigned) {}
-#endif
-
-// Parse a CPU-list string such as "0,2,4-10:2" -> {0,2,4,6,8,10}. Mirrors the
-// course helper Affinity.hpp::parse_cpu_list. Used only to let the AFFINITY
-// environment variable override the default compact (core == tid) policy, so
-// compact/scatter placements can be benchmarked without recompiling.
-static std::vector<unsigned> parse_cpu_list(const std::string& slist) {
-    std::vector<unsigned> cpus;
-    std::stringstream ss(slist);
-    std::string tok;
-    while (std::getline(ss, tok, ',')) {
-        // trim surrounding whitespace
-        const auto b = tok.find_first_not_of(" \t");
-        if (b == std::string::npos) continue;
-        const auto e = tok.find_last_not_of(" \t");
-        tok = tok.substr(b, e - b + 1);
-
-        const auto dash = tok.find('-');
-        if (dash == std::string::npos) {
-            cpus.push_back(static_cast<unsigned>(std::stoul(tok, nullptr, 0)));
-        } else {
-            const auto col = tok.find(':');
-            unsigned a = static_cast<unsigned>(std::stoul(tok.substr(0, dash), nullptr, 0));
-            unsigned hi, step = 1;
-            if (col == std::string::npos) {
-                hi = static_cast<unsigned>(std::stoul(tok.substr(dash + 1), nullptr, 0));
-            } else {
-                hi   = static_cast<unsigned>(std::stoul(tok.substr(dash + 1, col - (dash + 1)), nullptr, 0));
-                step = static_cast<unsigned>(std::stoul(tok.substr(col + 1), nullptr, 0));
-                if (step == 0) step = 1;
-            }
-            if (a > hi) std::swap(a, hi);
-            for (unsigned c = a; c <= hi; c += step) cpus.push_back(c);
-        }
-    }
-    return cpus;
-}
-
-// Resolve the logical CPU that worker `tid` should pin to. With AFFINITY set,
-// worker tid takes the tid-th entry of the parsed list (wrapping if shorter);
-// otherwise the compact default core == tid is used.
-static unsigned core_for_worker(unsigned tid) {
-    static const std::vector<unsigned> cpus = [] {
-        const char* env = std::getenv("AFFINITY");
-        return (env && *env) ? parse_cpu_list(env) : std::vector<unsigned>{};
-    }();
-    if (!cpus.empty()) return cpus[tid % cpus.size()];
-    return tid;
-}
 
 
 // number of iterations
@@ -193,28 +117,6 @@ static std::size_t compute_shift_rows(std::size_t n) {
 // invalidate neighbouring slots in other cores' caches (false sharing).
 struct alignas(64) PaddedDouble {
     double v = 0.0;
-};
-
-
-// Optimization E: std::barrier completion function (SPM NOTES p.83; course
-// example Code/spmcode6/spinbarrier-wait.cpp). Instead of every worker
-// redundantly reducing the partial sum-of-squares (P*P adds per iteration),
-// the last thread to reach the norm barrier runs this functor once (P adds),
-// in the same fixed order as before, and publishes the inverse L2 norm that all
-// workers then read. operator() must be noexcept to satisfy std::barrier's
-// CompletionFunction requirement.
-struct NormReducer {
-    const PaddedDouble* partial = nullptr;
-    unsigned            P       = 0;
-    double*             inv_norm = nullptr;
-
-    void operator()() noexcept {
-        double total = 0.0;
-        for (unsigned k = 0; k < P; ++k) {
-            total += partial[k].v;
-        }
-        *inv_norm = 1.0 / std::sqrt(total);
-    }
 };
 
 
@@ -274,19 +176,12 @@ static void worker_body(unsigned tid,
                         std::vector<double>& buf1,
                         std::vector<PaddedDouble>& partial,
                         std::vector<PaddedDouble>& partial_dot,
-                        std::barrier<NormReducer>& sync,
-                        const double& inv_norm,
+                        std::barrier<>& sync,
                         double& rayleigh_out) {
-    // Optimization C: pin this worker to a fixed logical CPU for the whole run.
-    pin_to_core(core_for_worker(tid));
-
     const std::size_t n = A.n;
-    // Optimization D: __restrict__ tells the compiler these arrays and the
-    // ping-pong buffers below do not alias, enabling tighter scheduling and
-    // vectorization of the scale/norm loops.
-    const std::uint64_t* __restrict__ rp = A.row_ptr.data();
-    const std::uint32_t* __restrict__ ci = A.col_idx.data();
-    const double*        __restrict__ va = A.values.data();
+    const std::uint64_t* rp = A.row_ptr.data();
+    const std::uint32_t* ci = A.col_idx.data();
+    const double*        va = A.values.data();
 
     for (std::uint32_t iter = 0; iter < NUM_ITERS; ++iter) {
         // Logical row shift for this iteration, derived locally (no shared
@@ -296,8 +191,8 @@ static void worker_body(unsigned tid,
         const std::size_t shift  = (shift_rows * epochs) % n;
 
         // Ping-pong buffers: read from one, write to the other.
-        const double* __restrict__ xr;
-        double*       __restrict__ yw;
+        const double* xr;
+        double*       yw;
         if ((iter & 1u) == 0u) {
             xr = buf0.data();
             yw = buf1.data();
@@ -320,12 +215,17 @@ static void worker_body(unsigned tid,
         }
         partial[tid].v = local_ss;
 
-        // Global reduction point: every worker waits for all partial sums. The
-        // barrier's completion function (NormReducer) reduces them once into the
-        // shared inv_norm; after crossing the barrier every worker reads the
-        // same published value. (Optimization E.)
+        // Global reduction point: every worker waits for all partial sums.
         sync.arrive_and_wait();
-        const double inv = inv_norm;
+
+        // Each worker reduces the partial sums in the same fixed order, so the
+        // resulting inverse norm is identical across workers (no need to
+        // publish a shared value).
+        double total = 0.0;
+        for (unsigned k = 0; k < P; ++k) {
+            total += partial[k].v;
+        }
+        const double inv = 1.0 / std::sqrt(total);
 
         // Phase B: scale the entries this worker produced.
         for (std::size_t src = s0; src < s1; ++src) {
@@ -398,11 +298,7 @@ static IterativeResult iterative_spmv_evolving_threads(const CSRMatrix& A,
 
     std::vector<PaddedDouble> partial(P);
     std::vector<PaddedDouble> partial_dot(P);
-
-    // Shared inverse L2 norm, written once per norm barrier by the completion
-    // function and read by all workers (Optimization E).
-    double inv_norm = 0.0;
-    std::barrier<NormReducer> sync(P, NormReducer{partial.data(), P, &inv_norm});
+    std::barrier<> sync(P);
     double rayleigh = 0.0;
 
     // Phase 2 + 3: spawn the persistent workers for the whole iterative loop
@@ -415,7 +311,7 @@ static IterativeResult iterative_spmv_evolving_threads(const CSRMatrix& A,
                              boundary[t], boundary[t + 1],
                              std::ref(buf0), std::ref(buf1),
                              std::ref(partial), std::ref(partial_dot),
-                             std::ref(sync), std::cref(inv_norm), std::ref(rayleigh));
+                             std::ref(sync), std::ref(rayleigh));
     }
     for (std::thread& th : threads) {
         th.join();
