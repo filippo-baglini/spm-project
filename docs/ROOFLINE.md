@@ -227,9 +227,9 @@ read+write of the vector) would give a real, measurable win.
    K1's throughput plateaus at the memory ceiling — exactly the falling efficiency (≈ 0.2–0.35 at
    t=32) seen for `cde`/`pool` in the speedup study, and why static-vs-dynamic scheduling only
    shuffles a few percent rather than changing the asymptote.
-3. **Highest-value future refinements** (not implemented — the versions already carry opts A–E):
-   - **NUMA-aware first-touch** of the CSR arrays / buffers (parallel init by the owning threads),
-     to close the gap between the kernels' one-node placement and the all-node STREAM ceiling.
+3. **Highest-value refinements:**
+   - **NUMA-aware first-touch** of the CSR arrays — **implemented and benchmarked**; see
+     "Cache & NUMA locality" below.
    - **Fuse the normalization into the next SpMV** to delete the K2 pass — worth ~30–40% per
      iteration *only* in the sparse, low-nnz/row regime; negligible for dense rows.
    - **Software-prefetch** `x[col_idx[p+D]]` to hide gather latency where below the ceiling.
@@ -246,3 +246,111 @@ first-touching in parallel (peak BW at 32 threads then rose to the correct ~49 G
 anomaly disappeared). The FMA microbench was also stiffened (64 chains) and a cached-`x` AI band
 added. Lesson worth keeping in the report: **first-touch placement determines measured bandwidth**
 — the very NUMA effect that also limits the real kernels.
+
+## Cache & NUMA locality optimization
+
+Having established that K1 is bound by **streaming the CSR matrix from DRAM** while `x` is already
+**L3-resident**, the natural question is whether the data structures (a custom `CSRMatrix` + a dense
+`vector`) admit better cache use / less data transfer. The honest, notes-grounded answer has three
+parts.
+
+**(a) Classic cache-blocking of `x` buys little here.** Blocking/tiling (SPM NOTES pp. 9–10, 24)
+pays off when the reused operand is far larger than cache — the dense-GEMM `B` matrix in the notes.
+Our reused operand is `x` (0.8–4 MB), which already *fits in the 20 MB L3* and is served at
+325–580 GB/s (see the hierarchical roofline). Column-tiling `x` would only **re-stream the matrix**
+(the actual bottleneck) to save traffic on an operand that is already cached — a bad trade. The
+generator also scatters columns by a *coprime stride* (`matrix_generation.hpp`, `make_coprime_stride`),
+so the matrix has **no bandwidth structure** for tiling or bandwidth-reducing reorderings (RCM) to
+exploit. SoA is already the right layout (the notes prefer SoA over AoS for vectorization, p. 39), and
+`__restrict__` aliasing is Opt D — so `col_idx`/`values` are *not* merged.
+
+**(b) The real lever is the matrix stream's NUMA placement.** The provided `generate_matrix` fills
+the matrix **serially**, so under the Linux first-touch policy every page of `row_ptr`/`col_idx`/
+`values` lands on the **single** NUMA node of the master thread. On the 2-socket node the pinned
+workers on the *other* socket then stream the whole matrix **across the interconnect** every
+iteration — the same effect that depressed the STREAM benchmark to ~25 GB/s before the parallel
+first-touch fix. The notes single out first-touch as "particularly beneficial for memory-bound and
+irregular workloads" (p. 95).
+
+*(An earlier version of this variant also column-sorted each row so the `x[col_idx[p]]` gather is
+monotone — a prefetch/TLB win that helped most on the densest matrix (~10% at 200 nnz/row) and ~0 on
+the sparsest. It was dropped to keep the comparison about NUMA alone: it changes the per-row summation
+order, so it perturbs the result at ~1e-16, whereas the bare NUMA replica is bit-identical.)*
+
+### The variants — one per parallel model
+
+Each model keeps its baseline file and gains a NUMA counterpart that adds an **untimed preprocessing
+pass** (matrix preparation, like the generation itself): a private CSR replica, allocated *untouched*
+with raw `new[]` (not `std::vector`, whose ctor would zero-init serially and re-create the single-node
+trap), then **first-touched in parallel** so the matrix is placed across both sockets.
+
+| baseline | NUMA variant | how the replica is first-touched |
+|---|---|---|
+| `iterative_SpMV_threads.cpp` (cde, static) | `iterative_SpMV_threads_numa.cpp` | P pinned threads, each touches *its own* nnz-balanced slice |
+| `iterative_SpMV_pool.cpp` (dynamic pool) | `iterative_SpMV_pool_numa.cpp` | P pinned helper threads over the same nnz partition |
+| `iterative_SpMV_omp.cpp` (taskloop) | `iterative_SpMV_omp_numa.cpp` | `#pragma omp parallel for schedule(static)` |
+
+**Key distinction — locality vs spread.** The static cde version assigns each worker a fixed row
+slice, so first-touching that slice on that worker's core gives **near-perfect locality** (each worker
+reads mostly local memory). The pool and OpenMP versions schedule chunks **dynamically**, so a worker
+does not necessarily process the slice it first-touched — there the replica only guarantees the matrix
+is **spread across both NUMA nodes' memory controllers**, not that each access is local. For a
+*bandwidth*-bound kernel the spread is itself a large win (it roughly doubles usable DRAM bandwidth —
+the STREAM 25→49 GB/s effect), but the dynamic models forgo the extra latency/locality bonus, so they
+gain **less** than cde.
+
+The timed region's scope is unchanged from each baseline; `x`/`y` are left as-is (L3-resident, so
+their NUMA placement is negligible).
+
+### Correctness
+
+`max|seq − numa| ≈ 6–8e-17` and rayleigh matches the sequential to 14 digits for all three variants.
+Strongest signal: `threads_numa` and `pool_numa` reproduce the **bit-identical checksum** of their
+baselines at every thread count — the NUMA relocation provably does not touch the numerics.
+`omp_numa` differs from `omp` only by the taskloop reduction's combination order (nondeterministic for
+`omp` too), still within tolerance.
+
+### Measured effect
+
+Run `sbatch scripts/run_numa.sbatch` then `scripts/compare_numa.sh` (prints the three
+baseline-vs-NUMA pairs + an approximate **matrix-stream bandwidth** `≈ ITERS·12·nnz / T` that rises as
+the stream spreads across both sockets). On single-socket WSL all variants are ~parity (no NUMA gain
+to be had there); the win appears on the multi-socket cluster node.
+
+**Cluster result (node01, 32 cpus, seed 111, median of 3). Geomean `numa/base` per model — <1 =
+the NUMA variant is faster than that model's own baseline:**
+
+| matrix (nnz/row) | cde (static) | pool (dynamic) | omp (dynamic) |
+|---|---|---|---|
+| 100k / 4M  (40)  | **0.90×** | 0.97× | 0.98× |
+| 100k / 20M (200) | 0.98× | 0.99× | 0.99× |
+| 500k / 4M  (8)   | **0.96×** | 0.95× | 0.98× |
+| 500k / 20M (40)  | **0.96×** | 0.98× | 0.98× |
+
+The **locality-vs-spread** prediction holds exactly:
+
+- **The static `cde` model gets the largest, most consistent win** (it has both locality *and* spread),
+  and the gain has the textbook NUMA signature — **it grows with thread count**: ~1.00× at low `p`
+  (one socket, nothing remote) and **0.82–0.92× by t=16–32** as more workers land on the far socket.
+- **The dynamic `pool`/`omp` models gain less** (mostly 0.95–0.99× geomean): they get only the
+  cross-socket *bandwidth spread*, because dynamic scheduling means a worker rarely processes the slice
+  it first-touched. Still a real win, concentrated at t=16–32.
+- **Correctness:** `cde_numa`/`pool_numa` checksums are **bit-identical to their baselines at every
+  (n, nz, p)**; `omp_numa` differs only by taskloop reduction order.
+
+**Cross-model (reading across the three at fixed `p`):** NUMA does not change the baseline ranking.
+At **t=32**, `cde_numa`/`omp_numa` are fastest while `pool_numa` lags (the pool's single global-queue
+mutex, not a NUMA issue); but at **mid `p` on the sparse/large cases** the dynamic models still lead —
+e.g. 500k/4M @ t=8: `pool_numa` 2.11 s and `omp_numa` 1.98 s vs `cde_numa` 3.35 s. So dynamic
+scheduling wins mid-range; NUMA mainly lets the *static* schedule pull ahead at high `p`, where only it
+can exploit true per-worker locality.
+
+**It does not change that the kernel is bandwidth-bound:** efficiency still decays at high `p` (numaE
+≈ 0.26–0.37 at t=32, same shape as the baselines, shifted up). NUMA placement *raises the achieved
+bandwidth* toward the ceiling (e.g. cde_numa matrix-stream GB/s* at t=32: 18–35, densest matrix
+highest); it does not lift the ceiling.
+
+> **Takeaway for the report:** the matrix-stream **volume** is irreducible in this CSR/double format,
+> and `x` is already optimally cached — so there is no cache-blocking headroom to chase. The one
+> avoidable cost is the **locality** of that stream (NUMA placement), and it pays off most for the
+> static schedule, where data can be placed next to the worker that will read it.
