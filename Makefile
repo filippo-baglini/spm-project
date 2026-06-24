@@ -18,10 +18,12 @@
 #   make threads_numa NUMA-locality threads variant        -> bin/threads_numa
 #   make pool_numa   NUMA-locality threadpool variant       -> bin/pool_numa
 #   make omp_numa    NUMA-locality OpenMP variant           -> bin/omp_numa
+#   make mpi         hybrid MPI+OpenMP (deliverable #3)      -> bin/mpi  (needs mpicxx)
 #   make roofline    empirical roofline analysis tool      -> bin/roofline
 #   make clean       remove the bin/ directory
 
 CXX      ?= g++
+MPICXX   ?= mpicxx
 CXXSTD   := -std=c++20
 OPTFLAGS := -O3 -march=native -funroll-loops -DNDEBUG
 WARN     := -Wall -Wextra
@@ -80,6 +82,13 @@ $(BIN)/pool_numa: src/threads/iterative_SpMV_pool_numa.cpp $(HEADERS) $(POOL_HEA
 # NUMA-locality OpenMP variant (first-touch replica + taskloop).
 $(BIN)/omp_numa: src/openmp/iterative_SpMV_omp_numa.cpp $(HEADERS) | $(BIN)
 	$(CXX) $(CXXFLAGS) -pthread -fopenmp $< -o $@
+
+# Hybrid MPI + OpenMP (deliverable #3). Built with mpicxx (cluster); kept out of
+# 'all' so a plain 'make' works on machines without an MPI toolchain.
+.PHONY: mpi
+mpi: $(BIN)/mpi
+$(BIN)/mpi: src/mpi/iterative_SpMV_mpi.cpp $(HEADERS) | $(BIN)
+	$(MPICXX) $(CXXSTD) $(OPTFLAGS) $(WARN) -I include -fopenmp $< -o $@
 
 # Empirical roofline analysis tool (peak compute + STREAM bandwidth + kernels).
 $(BIN)/roofline: src/bench/roofline_bench.cpp $(HEADERS) | $(BIN)

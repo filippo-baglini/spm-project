@@ -596,7 +596,66 @@ balancing to the runtime.
 
 ---
 
-## 5. Course grounding
+## 5. Hybrid MPI + OpenMP — `iterative_SpMV_mpi.cpp`
+
+The third deliverable adds **distributed memory**: MPI spreads the matrix across processes (ranks,
+possibly on different nodes), and OpenMP parallelizes each rank's share across its cores. It
+reproduces the same algorithm (§0.1) and is grounded in `Code/spmcode11/mpi_power_iteration_partitioned.cpp`
+(power iteration = repeated SpMV + normalize) and the hybrid idioms of `Code/spmcode12/mpi_trapezoid+omp.cpp`.
+
+### 5.1 What is distributed, and what is replicated
+
+- **The matrix is distributed by *source* rows** — the same "partition source rows, not output rows"
+  idea as the threads/omp versions (§0.2). The nnz-balanced block each rank owns is **fixed for the
+  whole run**, because the matrix evolution is a circular shift that we apply as a *vector* operation,
+  not a matrix one. This directly answers the sequential header's note that the evolution "must be
+  reflected consistently in the distributed data layout": it is, as a local rotation, so no matrix
+  data ever moves between ranks.
+- **The dense vector `x` is replicated** (full copy on every rank). It is only O(n) (≤4 MB), and the
+  irregular column gather `x[col_idx[p]]` can touch any entry, so every rank needs all of `x`. The
+  big O(nnz) data — the matrix — is what gets distributed.
+
+### 5.2 Setup: rank 0 generates, `MPI_Scatterv` distributes (untimed)
+
+Rank 0 calls the provided `generate_matrix` (deterministic, **untimed** like every version), computes
+the nnz-balanced `boundary[]` partition (the same routine as the threads/NUMA versions) and `Bcast`s
+it. The CSR is then distributed with two `MPI_Scatterv`s: first the per-row nnz counts (each rank
+prefix-sums them into a local, rebased `row_ptr`), then `values` and `col_idx` by nnz blocks. Column
+indices stay **global** (the gather is against the full `x`). Rank 0 frees the full matrix; from then
+on no rank holds it — true memory distribution.
+
+### 5.3 The per-iteration dataflow (one collective)
+
+```
+1. local SpMV (OpenMP):   z_local[i] = Σ_p va[p] · x[col_idx[p]]    for this rank's rows
+2. MPI_Allgatherv(z_local) → full z (natural source order) on every rank
+3. shift as a local rotation:  y[i] = z[(i − shift) mod n]          (= sequential's shifted SpMV)
+4. normalize y in canonical index order → x for the next iteration
+```
+
+`MPI_Init_thread(MPI_THREAD_FUNNELED)` is used because only the main thread calls MPI; the OpenMP
+`parallel for` regions just compute (one matrix row per thread, so each row's accumulation order is
+preserved). The **only collective per iteration is the `Allgatherv`** that rebuilds the full result
+vector — exactly the pattern of the partitioned power-iteration template. Because every rank already
+holds the full vector after the gather, the L2 norm is reduced **locally in canonical index order**
+rather than via a second `MPI_Allreduce`: that costs one fewer collective *and* makes the result
+**bit-for-bit identical to the sequential** (same per-row order, same global reduction order) for any
+rank × thread × node count — so the checksum *matches* the sequential, unlike the threads/omp
+versions whose reduction order differs. (An `Allreduce`-based norm is the more "collective" textbook
+choice and is noted in the code; it would match only within tolerance.)
+
+### 5.4 What is timed, and expected scaling
+
+`MPI_Wtime` brackets the **iterative loop only** (generation + Scatterv are setup, untimed —
+consistent with the project rule and the sequential's timed region); the reported time is the max
+over ranks. The work that scales is the SpMV (O(nnz) split across ranks × threads); the per-iteration
+`Allgatherv` of `x` (O(n)) is the communication that **grows with rank/node count** and, on top of
+the memory-bandwidth ceiling established in the roofline study, is what bounds strong scaling — most
+visibly across nodes. Build with `mpicxx … -fopenmp` (`make mpi`); sweep geometries with
+`scripts/submit_mpi_sweep.sh` (nodes ∈ {1,2,4,8} × rank/thread splits) and summarize with
+`scripts/compare_mpi.sh`.
+
+## 6. Course grounding
 
 Every technique traces to the SPM notes or the course `Code/` examples cited in each source
 file's header:
@@ -611,6 +670,9 @@ file's header:
 | `taskgroup` + `task_reduction` (the lower-level alternative) | `Code/spmcode9/omp_task_reduction.cpp` |
 | OpenMP affinity via environment | `Code/spmcode8/omp_affinity.cpp` |
 | Single-region iterative loop shape | `Code/spmcode8/jacobi-omp/jacobi-omp.cpp` |
+| Partitioned matrix + `Allgatherv`/`Allreduce` (MPI) | `Code/spmcode11/mpi_power_iteration_partitioned.cpp` |
+| `MPI_Scatterv` block distribution (MPI) | `Code/spmcode11/mpi_vectorsumv.cpp`, `Code/spmcode12/mpi_jacobi_1d_blk.cpp` |
+| Hybrid `MPI_Init_thread(FUNNELED)` + OpenMP loop (MPI+OpenMP) | `Code/spmcode12/mpi_trapezoid+omp.cpp`, `mpi_summa+omp.cpp` |
 
 This keeps all three implementations defensible against the project constraint that every
 technique come from the course material.
