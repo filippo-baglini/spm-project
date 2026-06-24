@@ -10,10 +10,12 @@
 #   bin/            build outputs (created here; gitignored)
 #
 # Targets:
-#   make             build 'seq', 'threads' and 'omp'
+#   make             build 'seq', 'threads', 'omp' and 'pool'
 #   make seq         sequential reference                 -> bin/seq
 #   make threads     C++ threads implementation           -> bin/threads
 #   make omp         OpenMP-tasks implementation          -> bin/omp
+#   make pool        threadpool comparison variant        -> bin/pool
+#   make roofline    empirical roofline analysis tool      -> bin/roofline
 #   make clean       remove the bin/ directory
 
 CXX      ?= g++
@@ -25,17 +27,22 @@ CXXFLAGS := $(CXXSTD) $(OPTFLAGS) $(WARN) -I include
 # Shared headers: rebuild the executables if any of these change.
 HEADERS  := include/matrix_generation.hpp include/utils.hpp
 
+# Vendored thread-pool headers (provided, Code/spmcode7), used by 'pool'.
+POOL_HEADERS := include/threadPool.hpp include/taskFactory.hpp include/Affinity.hpp
+
 BIN      := bin
 
 .PHONY: all clean
 
-all: seq threads omp
+all: seq threads omp pool
 
 # Convenience names so 'make threads' etc. still work; real outputs live in bin/.
-.PHONY: seq threads omp threads_AB threads_baseline
+.PHONY: seq threads omp pool roofline threads_AB threads_baseline
 seq:              $(BIN)/seq
 threads:          $(BIN)/threads
 omp:              $(BIN)/omp
+pool:             $(BIN)/pool
+roofline:         $(BIN)/roofline
 threads_AB:       $(BIN)/threads_AB
 threads_baseline: $(BIN)/threads_baseline
 
@@ -50,6 +57,14 @@ $(BIN)/threads: src/threads/iterative_SpMV_threads.cpp $(HEADERS) | $(BIN)
 
 # OpenMP-tasks implementation (deliverable #2).
 $(BIN)/omp: src/openmp/iterative_SpMV_omp.cpp $(HEADERS) | $(BIN)
+	$(CXX) $(CXXFLAGS) -pthread -fopenmp $< -o $@
+
+# Threadpool comparison variant (dynamic scheduling via the course pool).
+$(BIN)/pool: src/threads/iterative_SpMV_pool.cpp $(HEADERS) $(POOL_HEADERS) | $(BIN)
+	$(CXX) $(CXXFLAGS) -pthread $< -o $@
+
+# Empirical roofline analysis tool (peak compute + STREAM bandwidth + kernels).
+$(BIN)/roofline: src/bench/roofline_bench.cpp $(HEADERS) | $(BIN)
 	$(CXX) $(CXXFLAGS) -pthread -fopenmp $< -o $@
 
 # Frozen pre-optimization version, for benchmarking against 'threads'.
