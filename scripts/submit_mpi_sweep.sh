@@ -16,7 +16,11 @@
 #   ./scripts/submit_mpi_sweep.sh                  # nodes 1,2,4,8 ; splits 4:4 & 16:1
 #   NODES_LIST="1 2 4" ./scripts/submit_mpi_sweep.sh        # avoid the 8-node job
 #   SPLITS="4:4" MATRIX_SIZES=500000 NONZEROS=20000000 ./scripts/submit_mpi_sweep.sh
+#   VARIANTS="overlap" CHUNKS="1 2 4 8" ./scripts/submit_mpi_sweep.sh   # tune -c only
 #   DRYRUN=1 ./scripts/submit_mpi_sweep.sh         # print the sbatch lines only
+#
+# Each job times BOTH MPI variants by default: the blocking MPI_Allgatherv baseline
+# (results keyed mpi_*) and the non-blocking overlap (mpiov_*, one per -c in CHUNKS).
 #
 # Then summarize (seq baseline pooled from the NUMA run):
 #   DIR=results_mpi SEQ_DIRS="results_mpi results_numa" ./scripts/compare_mpi.sh
@@ -31,11 +35,13 @@ MATRIX_SIZES="${MATRIX_SIZES:-100000}"  # one small/fast size by default
 NONZEROS="${NONZEROS:-4000000}"
 REPS="${REPS:-2}"
 TIME="${TIME:-00:10:00}"
+VARIANTS="${VARIANTS:-block overlap}"   # time both MPI variants by default
+CHUNKS="${CHUNKS:-4}"                    # -c list for the overlap variant
 RESULTS_DIR="${RESULTS_DIR:-results_mpi}"
 SBATCH_SCRIPT="${SBATCH_SCRIPT:-scripts/run_mpi_quick.sbatch}"
 
 # Exported so each quick job (submitted with --export=ALL) inherits them.
-export MATRIX_SIZES NONZEROS REPS RESULTS_DIR
+export MATRIX_SIZES NONZEROS REPS VARIANTS CHUNKS RESULTS_DIR
 
 for nodes in $NODES_LIST; do
     cfgs=""

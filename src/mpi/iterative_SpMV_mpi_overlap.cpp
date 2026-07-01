@@ -1,66 +1,70 @@
 //
-// Hybrid MPI + OpenMP implementation for the One-Shot project (deliverable #3):
+// Hybrid MPI + OpenMP implementation -- OVERLAP variant (deliverable #3, b).
 //
 //   Iterative Sparse Matrix-Vector Computation on Evolving Sparse Matrices
 //
-// Parallelization strategy
-// ------------------------
-//   * MPI distributes the matrix by SOURCE ROWS: rank 0 generates the full CSR
-//     matrix (untimed, as in every version) and MPI_Scatterv distributes a
-//     contiguous, nnz-balanced block of rows to each rank. The partition is
-//     FIXED for the whole run: the matrix evolution is a circular row shift,
-//     which we apply as a cheap LOCAL VECTOR ROTATION, so no matrix data ever
-//     moves between ranks (the distributed analogue of the threads version's
-//     epoch-invariant static partition).
-//   * OpenMP parallelizes each rank's local SpMV across its cores.
-//   * The dense vector x is REPLICATED on every rank (it is only O(n) and the
-//     irregular column gather needs every entry of x). The big O(nnz) data --
-//     the matrix -- is what is distributed.
+// This is the communication/computation-OVERLAPPED counterpart of
+// src/mpi/iterative_SpMV_mpi.cpp. The algorithm, the matrix distribution, the
+// shift-as-rotation, and the distributed-Allreduce norm are IDENTICAL -- the ONLY
+// difference is how the per-iteration result vector is gathered:
 //
-// Per iteration (two collectives: one MPI_Allreduce + one MPI_Allgatherv):
-//   1. local fused SpMV in natural source order: z_local[i] = A_row(r0+i) . x
-//      (OpenMP parallel-for; one row per thread, so the per-row accumulation
-//       order is preserved, exactly as in the sequential reference).
-//   2. global L2 norm as a DISTRIBUTED two-level reduction (like the threads
-//      version's per-worker partial + barrier combine): each rank sums the
-//      squares of its OWN z_local slice (OpenMP reduction), then one
-//      MPI_Allreduce combines them. The shift is a permutation, so ||y|| == ||z||
-//      -- we reduce z_local directly, so each rank touches only n/size entries
-//      and no rank repeats a full-vector serial pass.
-//   3. MPI_Allgatherv -> the full natural-order vector z on every rank
-//      (unavoidable: the irregular, global-column SpMV needs all of x).
-//   4. apply the shift as a local rotation and scale in one pass:
-//      x_{k+1}[i] = z[(i - shift) mod n] / ||y||, which is exactly the
-//      sequential's normalized y[i] = A_row((i-shift) mod n) . x.
+//   * Blocking baseline (iterative_SpMV_mpi.cpp):
+//       compute ALL local rows  ->  one blocking MPI_Allgatherv.
+//     The whole SpMV runs, THEN the whole O(n) gather runs: the two largest
+//     costs are strictly serial.
 //
-// MPI_Allreduce returns the identical ss to every rank, so the replicated x
-// stays byte-identical across ranks (required, since the next SpMV gathers
-// x[global_column] everywhere). The reduction order differs from the sequential,
-// so the result matches it within TOLERANCE (checksum DIFFERS, like the
-// threads/omp versions) -- we trade the earlier bitwise match for dropping the
-// serial O(n) reduction each rank used to repeat. (To recover the bit-for-bit
-// match, reduce the full gathered vector in canonical index order instead.)
+//   * Overlap variant (THIS file):
+//       split the local rows into CHUNKS; as soon as a chunk's z_local is
+//       computed, fire a NON-BLOCKING MPI_Iallgatherv for it and keep computing
+//       the next chunk while that gather is in flight. A final MPI_Waitall
+//       drains the pipeline. The SpMV of chunk c overlaps the communication of
+//       chunks < c, so the per-iteration cost trends toward max(compute, comm)
+//       instead of compute + comm.
 //
-// Hybrid init: MPI_Init_thread(MPI_THREAD_FUNNELED) -- only the main thread calls
-// MPI; OpenMP regions only compute (course example Code/spmcode12/mpi_trapezoid+omp.cpp).
+// Why this is the only overlap available here: the iteration is a strict
+// dependency chain (SpMV -> gather -> rotate -> normalize -> next SpMV), so
+// iteration k's gather cannot overlap iteration k+1's SpMV. All overlap must be
+// INTRA-iteration, between the SpMV compute and the gather comm -- which is
+// exactly what the chunked pipeline does. The classic "local vs remote column"
+// SpMV overlap does not help: the matrix has random columns, so almost every
+// local row needs remote x entries (nothing local to hide behind).
 //
-// Timing: matrix generation AND the Scatterv distribution are SETUP and are NOT
-// timed (consistent with the project rule that generation is untimed and with
-// the sequential reference, whose timed region is the iterative loop only). They
-// are reported separately. The timed region is the iterative loop, measured with
-// MPI_Wtime around an MPI_Barrier; the reported time is the max over ranks.
+// MPI progress under MPI_THREAD_FUNNELED: only the main thread calls MPI, and it
+// is busy inside the OpenMP region while a chunk computes, so a background
+// Iallgatherv may not advance until the next MPI call. We DO NOT spin up a
+// progress thread (that needs MPI_THREAD_MULTIPLE, which the SPM notes do not
+// cover); instead we poll with MPI_Testall between chunks (notes p.139), which
+// nudges progress at every chunk boundary. The realistic win is therefore the
+// eager/early portion of each transfer overlapping the next chunk's compute --
+// largest in the moderate-rank regime where compute >= comm, and tapering off at
+// high node counts where comm dominates (the Allgatherv strong-scaling floor).
 //
-// Command line (same as the other versions):
+// Grounding (SPM NOTES): "All collectives have a non-blocking version" (p.141,
+// MPI_Ibarrier shown); non-blocking calls "let you overlap communication and
+// computation" + MPI_Wait/MPI_Test(all) (p.138-139); double buffering / async to
+// "maximize the overlap of computation and communication" (p.140). Same templates
+// as the baseline: Code/spmcode11/mpi_power_iteration_partitioned.cpp,
+// Code/spmcode12/mpi_trapezoid+omp.cpp.
+//
+// Correctness: the chunked Iallgatherv reassembles the SAME natural-order vector
+// z into the SAME positions of zf, so the result is bitwise identical to the
+// blocking baseline for any rank x thread x node x chunk count -- CHUNKS is a
+// tuning knob only. (Like the baseline it matches the sequential within tolerance,
+// not bit-for-bit, since the L2 norm is an MPI_Allreduce, not a canonical-order
+// sum -- see the baseline's header for why.)
+//
+// Command line (baseline args + one extra):
 //   -n N  -nz K  -m regular|irregular  [-s seed]  [-t threads_per_rank]
-//   [--dump-vector FILE]   (rank 0 dumps the final full vector)
+//   [-c chunks]            (#pipeline chunks per gather; default 4; 1 == blocking-like)
+//   [--dump-vector FILE]
 //
 // Build (cluster):
 //   mpicxx -O3 -std=c++20 -fopenmp -I include
-//          src/mpi/iterative_SpMV_mpi.cpp -o bin/mpi
-//   (or: make mpi)
+//          src/mpi/iterative_SpMV_mpi_overlap.cpp -o bin/mpi_overlap
+//   (or: make mpi_overlap)
 //
 // Run:
-//   mpirun -np 4 ./bin/mpi -n 500000 -nz 20000000 -m irregular -t 8
+//   mpirun -np 4 ./bin/mpi_overlap -n 500000 -nz 20000000 -m irregular -t 8 -c 4
 //
 
 #include <algorithm>
@@ -125,7 +129,7 @@ static std::size_t compute_shift_rows(std::size_t n) {
 
 // NNZ-balanced contiguous partition of source rows [0, n) over `size` ranks,
 // from a raw row_ptr prefix-sum array. boundary[r]..boundary[r+1] is rank r's
-// row block. Same logic as the threads/NUMA versions.
+// row block. Same logic as the threads/NUMA and blocking-MPI versions.
 static std::vector<std::size_t> nnz_balanced_partition(const std::uint64_t* row_ptr,
                                                        std::size_t n, int size) {
     const std::uint64_t total_nnz = row_ptr[n];
@@ -149,7 +153,7 @@ static std::vector<std::size_t> nnz_balanced_partition(const std::uint64_t* row_
 
 
 // This rank's distributed slice of the matrix, plus the row counts/displs used
-// to reassemble the full result vector with MPI_Allgatherv.
+// to reassemble the full result vector with the (I)Allgatherv.
 struct DistCSR {
     std::size_t r0 = 0;           // first global source row owned by this rank
     int local_rows = 0;           // number of source rows owned
@@ -164,13 +168,13 @@ struct DistCSR {
 // Rank 0 generates the full matrix, computes the nnz-balanced partition, and
 // MPI_Scatterv distributes the CSR. Returns this rank's local slice. UNTIMED
 // (matrix preparation). Reports generation/scatter wall times via the out-params.
+// (Identical to the blocking baseline.)
 static DistCSR setup_local_csr(std::size_t n, std::uint64_t nz, std::uint64_t seed,
                                const std::string& mode, int rank, int size,
                                double& gen_sec, double& scatter_sec) {
     gen_sec = 0.0;
     scatter_sec = 0.0;
 
-    // --- rank 0: generate + partition ---
     GeneratedMatrix G;                 // full matrix, rank 0 only
     std::vector<std::size_t> boundary; // size+1, broadcast to all
     if (rank == 0) {
@@ -185,7 +189,6 @@ static DistCSR setup_local_csr(std::size_t n, std::uint64_t nz, std::uint64_t se
 
     const double ts0 = MPI_Wtime();
 
-    // Broadcast the partition so every rank knows all row blocks.
     {
         std::vector<long long> b(size + 1);
         if (rank == 0) for (int r = 0; r <= size; ++r) b[r] = static_cast<long long>(boundary[r]);
@@ -197,8 +200,6 @@ static DistCSR setup_local_csr(std::size_t n, std::uint64_t nz, std::uint64_t se
     D.r0 = boundary[rank];
     D.local_rows = static_cast<int>(boundary[rank + 1] - boundary[rank]);
 
-    // Row counts/displs (used both for the per-row-nnz scatter and, later, the
-    // Allgatherv of the result vector z).
     D.rcounts.resize(size);
     D.rdispls.resize(size);
     for (int r = 0; r < size; ++r) {
@@ -206,8 +207,6 @@ static DistCSR setup_local_csr(std::size_t n, std::uint64_t nz, std::uint64_t se
         D.rdispls[r] = static_cast<int>(boundary[r]);
     }
 
-    // 1) Scatter the per-row nnz counts (disjoint, by row blocks), then each rank
-    //    prefix-sums them into its rebased local row_ptr.
     std::vector<int> nnz_per_row;       // rank 0 only, length n
     if (rank == 0) {
         nnz_per_row.resize(n);
@@ -225,8 +224,6 @@ static DistCSR setup_local_csr(std::size_t n, std::uint64_t nz, std::uint64_t se
     for (int i = 0; i < D.local_rows; ++i) D.lrp[i + 1] = D.lrp[i] + static_cast<std::uint64_t>(lnnz[i]);
     const std::uint64_t local_nnz = D.lrp[D.local_rows];
 
-    // 2) Scatter values and col_idx by nnz blocks. For the project sizes the
-    //    global nnz (<= 2e7) fits in int; guard otherwise.
     std::vector<int> ncounts, ndispls; // rank 0 only
     if (rank == 0) {
         ncounts.resize(size);
@@ -257,8 +254,49 @@ static DistCSR setup_local_csr(std::size_t n, std::uint64_t nz, std::uint64_t se
                            0, MPI_COMM_WORLD), "Scatterv(col_idx)");
 
     scatter_sec = MPI_Wtime() - ts0;
-    // rank 0's full matrix (G) is freed here as the function returns.
     return D;
+}
+
+
+// Per-chunk gather metadata, precomputed once. Every rank deterministically
+// splits EVERY rank's local row block into `C` contiguous sub-blocks (same rule
+// everywhere), so for each chunk c we know the per-rank counts/displacements that
+// drive the c-th Iallgatherv. (The split must be a global function of the row
+// counts because Iallgatherv is a collective -- all ranks issue the same C calls
+// in the same order.)
+struct ChunkPlan {
+    int C = 1;
+    std::vector<std::vector<int>> counts;   // counts[c][r] : rows of rank r in chunk c
+    std::vector<std::vector<int>> displs;   // displs[c][r] : global zf offset of that block
+    std::vector<int> my_lo;                 // local start (within z_local) of this rank's chunk c
+    std::vector<int> my_cnt;                // this rank's row count in chunk c
+};
+
+static ChunkPlan build_chunk_plan(const DistCSR& D, int rank, int size, int C) {
+    if (C < 1) C = 1;
+    ChunkPlan P;
+    P.C = C;
+    P.counts.assign(C, std::vector<int>(size, 0));
+    P.displs.assign(C, std::vector<int>(size, 0));
+    P.my_lo.assign(C, 0);
+    P.my_cnt.assign(C, 0);
+    for (int r = 0; r < size; ++r) {
+        const int rc   = D.rcounts[r];
+        const int base = rc / C;
+        const int rem  = rc % C;
+        int off = 0;                                   // local offset within rank r's block
+        for (int c = 0; c < C; ++c) {
+            const int sz = base + (c < rem ? 1 : 0);   // front-loaded remainder
+            P.counts[c][r] = sz;
+            P.displs[c][r] = D.rdispls[r] + off;       // global offset into zf
+            off += sz;
+        }
+    }
+    for (int c = 0; c < C; ++c) {
+        P.my_cnt[c] = P.counts[c][rank];
+        P.my_lo[c]  = P.displs[c][rank] - static_cast<int>(D.r0);  // == local offset
+    }
+    return P;
 }
 
 
@@ -276,9 +314,7 @@ int main(int argc, char** argv) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // Parse args on every rank (argv is replicated by the launcher; deterministic
-    // so no broadcast of parameters is needed).
-    std::uint64_t n64 = 0, nz = 0, seed = 111, threads = 0;
+    std::uint64_t n64 = 0, nz = 0, seed = 111, threads = 0, chunks = 4;
     std::string mode, dump_vector_path;
     if (!read_arg_u64(argc, argv, "-n", n64) ||
         !read_arg_u64(argc, argv, "-nz", nz) ||
@@ -286,6 +322,7 @@ int main(int argc, char** argv) {
         if (rank == 0) {
             usage(argv[0]);
             std::cerr << "  -t   Optional OpenMP threads per rank (default: omp_get_max_threads)\n";
+            std::cerr << "  -c   Optional #pipeline chunks per gather (default: 4; 1 = no overlap)\n";
         }
         MPI_Finalize();
         return 1;
@@ -293,52 +330,79 @@ int main(int argc, char** argv) {
     (void)read_arg_u64(argc, argv, "-s", seed);
     (void)read_arg_str(argc, argv, "--dump-vector", dump_vector_path);
     if (!read_arg_u64(argc, argv, "-t", threads)) (void)read_arg_u64(argc, argv, "--threads", threads);
+    (void)read_arg_u64(argc, argv, "-c", chunks);
 
     int nthreads = static_cast<int>(threads);
     if (nthreads <= 0) nthreads = omp_get_max_threads();
     if (nthreads <= 0) nthreads = 1;
 
+    int C = static_cast<int>(chunks);
+    if (C < 1) C = 1;
+
     const std::size_t n = static_cast<std::size_t>(n64);
-    if (rank == 0) std::cout << "SPARSE_ITERATION_MPI_OMP\n";
+    if (rank == 0) std::cout << "SPARSE_ITERATION_MPI_OMP_OVERLAP\n";
 
     try {
         // --- Setup (UNTIMED): generate on rank 0 + Scatterv the CSR ---
         double gen_sec = 0.0, scatter_sec = 0.0;
         const DistCSR D = setup_local_csr(n, nz, seed, mode, rank, size, gen_sec, scatter_sec);
+        const ChunkPlan plan = build_chunk_plan(D, rank, size, C);
 
         if (rank == 0) {
             std::cout << "ranks=" << size << "\n";
             std::cout << "threads_per_rank=" << nthreads << "\n";
+            std::cout << "overlap_chunks=" << C << "\n";
             std::cout << "generation_time_sec=" << gen_sec << "\n";
             std::cout << "scatter_time_sec=" << scatter_sec << "\n\n";
         }
 
         const std::size_t shift_rows = compute_shift_rows(n);
 
-        // Replicated full vectors. x: current iterate; zf: gathered SpMV result.
         std::vector<double> x(n);
         std::vector<double> zf(n);
 
-        // Initial vector, identical to the sequential reference, on every rank.
         SplitMix64 rng(seed ^ 0x123456789abcdef0ULL);
         for (double& v : x) v = rng.next_unit();
         normalize(x);
 
-        // Local CSR (raw aliases).
         const std::uint64_t* lrp = buffer_ptr(D.lrp);
         const std::uint32_t* lci = buffer_ptr(D.lci);
         const double*        lva = buffer_ptr(D.lva);
         std::vector<double> z_local(D.local_rows);
 
-        // One local SpMV phase (fused: writes z_local). OpenMP over local rows.
-        auto local_spmv = [&]() {
-            #pragma omp parallel for schedule(static) num_threads(nthreads)
-            for (int i = 0; i < D.local_rows; ++i) {
-                double sum = 0.0;
-                for (std::uint64_t p = lrp[i]; p < lrp[i + 1]; ++p)
-                    sum += lva[p] * x[lci[p]];
-                z_local[i] = sum;
+        // Pipelined SpMV + gather: for each chunk, compute its z_local rows then
+        // launch a non-blocking Iallgatherv; the next chunk's SpMV overlaps the
+        // in-flight gather. MPI_Testall between chunks nudges progress (FUNNELED:
+        // main thread only). On return, zf holds the full natural-order vector.
+        std::vector<MPI_Request> reqs(C, MPI_REQUEST_NULL);
+        auto gather_pipelined = [&]() {
+            for (int c = 0; c < C; ++c) {
+                const int lo  = plan.my_lo[c];
+                const int cnt = plan.my_cnt[c];
+
+                // Compute this rank's chunk-c rows of z_local (OpenMP).
+                #pragma omp parallel for schedule(static) num_threads(nthreads)
+                for (int i = lo; i < lo + cnt; ++i) {
+                    double sum = 0.0;
+                    for (std::uint64_t p = lrp[i]; p < lrp[i + 1]; ++p)
+                        sum += lva[p] * x[lci[p]];
+                    z_local[i] = sum;
+                }
+
+                // Non-blocking gather of chunk c (every rank contributes its
+                // chunk-c block; count may be 0 but the collective is still issued).
+                const double* sbuf = (cnt > 0) ? (z_local.data() + lo) : nullptr;
+                check_mpi(MPI_Iallgatherv(sbuf, cnt, MPI_DOUBLE,
+                                          buffer_ptr(zf),
+                                          plan.counts[c].data(), plan.displs[c].data(),
+                                          MPI_DOUBLE, MPI_COMM_WORLD, &reqs[c]),
+                          "Iallgatherv(chunk)");
+
+                // Poll: advance the earlier in-flight gathers (notes p.139).
+                int flag = 0;
+                MPI_Testall(c + 1, reqs.data(), &flag, MPI_STATUSES_IGNORE);
             }
+            MPI_Waitall(C, reqs.data(), MPI_STATUSES_IGNORE);
         };
 
         // --- Timed iterative loop (the only thing measured) ---
@@ -350,19 +414,15 @@ int main(int argc, char** argv) {
             if (iter > 0 && (iter % EPOCH_LEN) == 0)
                 row_shift = (row_shift + shift_rows) % n;
 
-            local_spmv();
+            gather_pipelined();    // SpMV + overlapped Allgatherv -> zf (and z_local)
 
-            // Global L2 norm as a DISTRIBUTED two-level reduction -- the analogue
-            // of the threads version's per-worker partial + barrier combine: each
-            // rank sums the squares of its OWN local slice, then one MPI_Allreduce
-            // combines them. The shift is a permutation, so ||y|| == ||z||, and we
-            // reduce z_local directly: each rank touches only its n/size entries
-            // (OpenMP-parallel), with no full-vector serial pass. MPI_Allreduce
-            // delivers the SAME ss to every rank, so the replicated x stays
-            // byte-identical across ranks (required, since the next SpMV gathers
-            // x[global_column] on every rank). This trades the bit-for-bit match
-            // with the sequential (now tolerance-level, like the threads/omp
-            // versions) for removing the serial O(n) reduction every rank repeated.
+            // Global L2 norm as a DISTRIBUTED two-level reduction (per-rank partial
+            // over z_local + MPI_Allreduce), exactly as in the blocking baseline.
+            // The shift is a permutation, so ||y|| == ||z||; each rank reduces only
+            // its n/size local rows and no rank repeats a full-vector serial pass.
+            // MPI_Allreduce gives every rank the same ss, keeping the replicated x
+            // byte-identical across ranks. Result now matches the sequential within
+            // tolerance (checksum DIFFERS, like the threads/omp versions).
             double partial_ss = 0.0;
             #pragma omp parallel for reduction(+: partial_ss) \
                 schedule(static) num_threads(nthreads)
@@ -372,14 +432,8 @@ int main(int argc, char** argv) {
                       "Allreduce(ss)");
             const double inv = 1.0 / std::sqrt(ss);
 
-            // Gather the full natural-order vector (unavoidable: the irregular,
-            // global-column SpMV needs every entry of x on every rank).
-            check_mpi(MPI_Allgatherv(buffer_ptr(z_local), D.local_rows, MPI_DOUBLE,
-                                     buffer_ptr(zf), D.rcounts.data(), D.rdispls.data(),
-                                     MPI_DOUBLE, MPI_COMM_WORLD), "Allgatherv(z)");
-
-            // Shift (logical, local rotation) + scale into x, in one pass:
-            // x[i] = z[(i - shift) mod n] / ||y||. Per-element and independent.
+            // Shift (logical, local rotation) + scale into x in one pass:
+            // x[i] = z[(i - shift) mod n] / ||y||.
             #pragma omp parallel for schedule(static) num_threads(nthreads)
             for (std::size_t i = 0; i < n; ++i) {
                 std::size_t src = i + n - row_shift;
@@ -390,10 +444,7 @@ int main(int argc, char** argv) {
 
         // Final diagnostics (inside the timed region, as in the sequential code):
         // one extra shifted SpMV, rayleigh = dot(x, y) with y the shifted result.
-        local_spmv();
-        check_mpi(MPI_Allgatherv(buffer_ptr(z_local), D.local_rows, MPI_DOUBLE,
-                                 buffer_ptr(zf), D.rcounts.data(), D.rdispls.data(),
-                                 MPI_DOUBLE, MPI_COMM_WORLD), "Allgatherv(z_final)");
+        gather_pipelined();
         double rayleigh = 0.0;
         for (std::size_t i = 0; i < n; ++i) {
             std::size_t src = i + n - row_shift;

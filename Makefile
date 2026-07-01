@@ -39,13 +39,14 @@ BIN      := bin
 
 .PHONY: all clean
 
-all: seq threads omp pool threads_numa pool_numa omp_numa
+all: seq threads omp omp_ws pool threads_numa pool_numa omp_numa
 
 # Convenience names so 'make threads' etc. still work; real outputs live in bin/.
-.PHONY: seq threads omp pool threads_numa pool_numa omp_numa roofline threads_AB threads_baseline
+.PHONY: seq threads omp omp_ws pool threads_numa pool_numa omp_numa roofline threads_AB threads_baseline
 seq:              $(BIN)/seq
 threads:          $(BIN)/threads
 omp:              $(BIN)/omp
+omp_ws:           $(BIN)/omp_ws
 pool:             $(BIN)/pool
 threads_numa:     $(BIN)/threads_numa
 pool_numa:        $(BIN)/pool_numa
@@ -67,6 +68,10 @@ $(BIN)/threads: src/threads/iterative_SpMV_threads.cpp $(HEADERS) | $(BIN)
 $(BIN)/omp: src/openmp/iterative_SpMV_omp.cpp $(HEADERS) | $(BIN)
 	$(CXX) $(CXXFLAGS) -pthread -fopenmp $< -o $@
 
+# OpenMP work-sharing variant (optional comparison point; schedule via OMP_SCHEDULE).
+$(BIN)/omp_ws: src/openmp/iterative_SpMV_omp_ws.cpp $(HEADERS) | $(BIN)
+	$(CXX) $(CXXFLAGS) -pthread -fopenmp $< -o $@
+
 # Threadpool comparison variant (dynamic scheduling via the course pool).
 $(BIN)/pool: src/threads/iterative_SpMV_pool.cpp $(HEADERS) $(POOL_HEADERS) | $(BIN)
 	$(CXX) $(CXXFLAGS) -pthread $< -o $@
@@ -85,9 +90,14 @@ $(BIN)/omp_numa: src/openmp/iterative_SpMV_omp_numa.cpp $(HEADERS) | $(BIN)
 
 # Hybrid MPI + OpenMP (deliverable #3). Built with mpicxx (cluster); kept out of
 # 'all' so a plain 'make' works on machines without an MPI toolchain.
-.PHONY: mpi
+#   mpi          blocking Allgatherv baseline      -> bin/mpi
+#   mpi_overlap  non-blocking Iallgatherv overlap  -> bin/mpi_overlap
+.PHONY: mpi mpi_overlap
 mpi: $(BIN)/mpi
+mpi_overlap: $(BIN)/mpi_overlap
 $(BIN)/mpi: src/mpi/iterative_SpMV_mpi.cpp $(HEADERS) | $(BIN)
+	$(MPICXX) $(CXXSTD) $(OPTFLAGS) $(WARN) -I include -fopenmp $< -o $@
+$(BIN)/mpi_overlap: src/mpi/iterative_SpMV_mpi_overlap.cpp $(HEADERS) | $(BIN)
 	$(MPICXX) $(CXXSTD) $(OPTFLAGS) $(WARN) -I include -fopenmp $< -o $@
 
 # Empirical roofline analysis tool (peak compute + STREAM bandwidth + kernels).

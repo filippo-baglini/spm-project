@@ -39,7 +39,12 @@ MODE="${MODE:-irregular}"
 SEED="${SEED:-111}"
 TIME_BUDGET_SEC="${TIME_BUDGET_SEC:-1500}"
 
+# Which MPI variants to time, and (for overlap) the pipeline-chunk list.
+VARIANTS="${VARIANTS:-block overlap}"     # block | overlap | "block overlap"
+CHUNKS="${CHUNKS:-4}"                      # space-separated -c values for the overlap variant
+
 MPI_SRC="${MPI_SRC:-src/mpi/iterative_SpMV_mpi.cpp}"
+MPI_OVL_SRC="${MPI_OVL_SRC:-src/mpi/iterative_SpMV_mpi_overlap.cpp}"
 SEQ_SRC="${SEQ_SRC:-src/sequential/iterative_SpMV.cpp}"
 MPICXX="${MPICXX:-mpicxx}"
 BASE_CXXFLAGS="-O3 -march=native -funroll-loops -DNDEBUG -std=c++20 -Wall -Wextra"
@@ -58,12 +63,24 @@ TPR="${SLURM_CPUS_PER_TASK:-1}"
 export OMP_NUM_THREADS="$TPR"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-close}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
-MAP="${MAP:---map-by ppr:${RPN}:node:pe=${TPR} --bind-to core}"
+# One rank/node (RPN=1) owns the whole node: pe=<cores/node> spans both sockets,
+# which OpenMPI core-binding rejects -- leave it unbound, OpenMP pins the threads.
+if [ -z "${MAP:-}" ]; then
+    if [ "$RPN" -eq 1 ]; then MAP="--map-by ppr:1:node --bind-to none"
+    else MAP="--map-by ppr:${RPN}:node:pe=${TPR} --bind-to core"; fi
+fi
 
 echo "=== Building (host: $(hostname)) ==="
-[ -f "$MPI_SRC" ] || { echo "ERROR: $MPI_SRC not found" >&2; exit 1; }
-$MPICXX $BASE_CXXFLAGS -I include -fopenmp "$MPI_SRC" -o "$BUILD/mpi" \
-    || { echo "build failed: $MPI_SRC (is mpicxx available?)" >&2; exit 1; }
+case " $VARIANTS " in *" block "*)
+    [ -f "$MPI_SRC" ] || { echo "ERROR: $MPI_SRC not found" >&2; exit 1; }
+    $MPICXX $BASE_CXXFLAGS -I include -fopenmp "$MPI_SRC" -o "$BUILD/mpi" \
+        || { echo "build failed: $MPI_SRC (is mpicxx available?)" >&2; exit 1; } ;;
+esac
+case " $VARIANTS " in *" overlap "*)
+    [ -f "$MPI_OVL_SRC" ] || { echo "ERROR: $MPI_OVL_SRC not found" >&2; exit 1; }
+    $MPICXX $BASE_CXXFLAGS -I include -fopenmp "$MPI_OVL_SRC" -o "$BUILD/mpi_overlap" \
+        || { echo "build failed: $MPI_OVL_SRC (is mpicxx available?)" >&2; exit 1; } ;;
+esac
 g++ $BASE_CXXFLAGS -I include "$SEQ_SRC" -o "$BUILD/seq" \
     || { echo "build failed: $SEQ_SRC" >&2; exit 1; }
 
@@ -103,7 +120,9 @@ run_one() {   # echo "<time> <checksum>"
     cs=$(echo "$out" | grep "checksum=" | head -1 | cut -d= -f2)
     echo "${tm:-NA} ${cs:-NA}"
 }
-complete() { [ -f "$1" ] && [ "$(grep -c . "$1")" -ge "$REPS" ]; }
+# Complete only with >=REPS NUMERIC samples; "NA" (failed run) lines don't count,
+# so failures are retried on resume.
+complete() { [ -f "$1" ] && [ "$(grep -cE '^[0-9]' "$1")" -ge "$REPS" ]; }
 over_budget() { [ "$SECONDS" -ge "$TIME_BUDGET_SEC" ]; }
 stop_early() {
     echo ""
@@ -127,21 +146,35 @@ for n in $MATRIX_SIZES; do
   done
 done
 
-# Hybrid MPI+OpenMP for THIS geometry.
-echo ""
-echo "=== MPI+OpenMP  geometry $GEO (ranks=$RANKS, threads/rank=$TPR) ==="
-for n in $MATRIX_SIZES; do
-  for nz in $NONZEROS; do
-    f="$RAW/mpi_n${n}_nz${nz}_${GEO}.times"
-    if complete "$f"; then echo "skip (done) mpi n=$n nz=$nz $GEO"; continue; fi
+# Run one variant for the current (n,nz,GEO) into $RAW/$1.times (+ .cksum),
+# resumable + budget-guarded. $1=fbase, $2=label, $3=binary, rest=extra bin args.
+bench_variant() {
+    local fbase="$1" label="$2" bin="$3"; shift 3
+    local f="$RAW/${fbase}.times"
+    if complete "$f"; then echo "skip (done) $label n=$n nz=$nz $GEO ${*:+$*}"; return; fi
     over_budget && stop_early
     : > "$f"
     for r in $(seq 1 $REPS); do
-      read tm cs < <(run_one mpirun -np "$RANKS" $MAP "$BUILD/mpi" -n $n -nz $nz -m $MODE -s $SEED -t $TPR)
+      read tm cs < <(run_one mpirun -np "$RANKS" $MAP "$bin" -n $n -nz $nz -m $MODE -s $SEED -t $TPR "$@")
       echo "$tm" >> "$f"
-      echo "$cs" >  "$RAW/mpi_n${n}_nz${nz}_${GEO}.cksum"
-      echo "mpi n=$n nz=$nz $GEO rep=$r time=$tm"
+      echo "$cs" >  "$RAW/${fbase}.cksum"
+      echo "$label n=$n nz=$nz $GEO ${*:+$* }rep=$r time=$tm"
     done
+}
+
+# Hybrid MPI+OpenMP for THIS geometry (both variants).
+echo ""
+echo "=== MPI+OpenMP  geometry $GEO (ranks=$RANKS, threads/rank=$TPR)  variants=[$VARIANTS] chunks=[$CHUNKS] ==="
+for n in $MATRIX_SIZES; do
+  for nz in $NONZEROS; do
+    case " $VARIANTS " in *" block "*)
+        bench_variant "mpi_n${n}_nz${nz}_${GEO}" "mpi    " "$BUILD/mpi" ;;
+    esac
+    case " $VARIANTS " in *" overlap "*)
+        for C in $CHUNKS; do
+            bench_variant "mpiov_n${n}_nz${nz}_${GEO}_c${C}" "mpi-ovl" "$BUILD/mpi_overlap" -c "$C"
+        done ;;
+    esac
   done
 done
 

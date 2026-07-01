@@ -3,9 +3,10 @@
 **Project:** Iterative Sparse Matrix-Vector Computation on Evolving Sparse Matrices
 **Files explained here, line by line:**
 `src/threads/iterative_SpMV_threads.cpp` (C++ threads) and
-`src/openmp/iterative_SpMV_omp.cpp` (OpenMP based on tasks), plus a comparison
-variant `src/threads/iterative_SpMV_pool.cpp` (C++ threads driven by the course
-thread pool — §3).
+`src/openmp/iterative_SpMV_omp.cpp` (OpenMP based on tasks), plus two comparison
+variants: `src/threads/iterative_SpMV_pool.cpp` (C++ threads driven by the course
+thread pool — §3) and `src/openmp/iterative_SpMV_omp_ws.cpp` (optional OpenMP
+**work-sharing** version — §2.9).
 
 This is the **deep companion** to `DOCUMENTATION.md`. That document is a *survey* of every file
 in the project; here we zoom in on the two parallel sources and explain **every concurrency
@@ -460,6 +461,72 @@ so placement can be changed per run. Course reference: `Code/spmcode8/omp_affini
   `rayleigh=`, `checksum=0x…`, `Time (sec) =` lines the analyzer greps, so `analyze_all.sh`
   parses it unchanged.
 
+### 2.9 Optional variant: OpenMP **work-sharing** — `iterative_SpMV_omp_ws.cpp`
+
+The assignment permits *"an additional OpenMP implementation based on **work-sharing constructs**"*
+as a comparison point. `src/openmp/iterative_SpMV_omp_ws.cpp` is that variant: it is a **byte-for-byte
+clone** of the task version above (same serial init, ping-pong buffers, local shift, fused SpMV+norm,
+diagnostics, CLI, timing, output) with **only the engine swapped** — `#pragma omp for` worksharing
+loops instead of `taskloop` tasks. It exists *only* to contrast the two work-distribution mechanisms;
+the task-based version remains the required deliverable.
+
+What changes, and why it is the interesting contrast:
+
+- **`#pragma omp for` instead of `taskloop`.** The same persistent `#pragma omp parallel` wraps the
+  loop (fair comparison), but each iteration's two phases are worksharing loops the *whole team*
+  executes, not a `single`-generated task set. There is therefore **no per-iteration task generation**
+  — the team simply divides the loop iteration space. Phase A is `#pragma omp for reduction(+: ss)`
+  (fused shifted SpMV + L2 sum-of-squares); Phase B is a plain `#pragma omp for` (scaling). The
+  **implicit barrier** at the end of each worksharing loop replaces the taskgroup/`single` barrier.
+- **Granularity knob = the `schedule` clause, not `grainsize`.** The loops use `schedule(runtime)`, so
+  the policy is chosen at run time via **`OMP_SCHEDULE`** (`static`, `dynamic[,chunk]`, `guided`) with
+  no recompile — the worksharing analogue of §2.5's `GRAIN`. The binary prints the resolved
+  schedule (`omp_get_schedule`) so each run is self-documenting. This is the axis the report's
+  granularity analysis sweeps.
+- **Granularity finding (the headline result).** The first sweep made the worksharing version look
+  hopeless — every schedule capped ~2.5× and `dynamic` ran *worse than serial* with non-monotone
+  `t=16 < t=8` inversions. This is **not** a mechanism defect; it is a **granularity trap**. Bare
+  `OMP_SCHEDULE=dynamic` resolves to **chunk = 1**: the runtime hands out one row per dispatch, so each
+  phase does ~`n` dynamic dispatches per iteration and the shared loop counter is hammered across both
+  sockets — pathological. The fair comparison is at *matched* granularity: the task version's
+  `taskloop grainsize(n/8P)` (§2.5) is effectively `schedule(dynamic, ~n/8P)`, so we add a
+  **`dynamic,auto`** point that the sweep expands per `(n,t)` to `dynamic,⌊n/(8t)⌋` — exactly the task
+  grainsize. With that chunk, **worksharing `dynamic` reproduces the task version (~8–10×)**, proving
+  the bottleneck was granularity, not "tasks vs worksharing." The full curve brackets it: bare
+  `dynamic` (chunk 1) catastrophic → `dynamic,auto`/`dynamic,2048` ≈ tasks → `dynamic,16384` slightly
+  worse at high `t` (too coarse) → `static`/`guided` ≈ 2.5× (contiguous chunks meet the heavy-rows-first
+  layout). The sweep keeps bare `dynamic` *on purpose* as the failure-end data point.
+- **Confirmed on the cluster (node01, 32 cpus, medians of 3).** `ws_dynamic_auto` at t=32 reaches
+  **9.7× / 10.7× / 8.4× / 10.5×** on the four matrices (100k/4M, 100k/20M, 500k/4M, 500k/20M) — it
+  *matches and slightly beats* `omp_tasks` (7.3× / 9.9× / 7.5× / 10.0×) at t=16/32, because `omp for`
+  with a tuned chunk has lower per-dispatch cost than `taskloop`'s per-iteration task creation. The
+  trap is worst on the **sparse** matrix (500k/4M, 8 nnz/row): bare `dynamic` runs **0.27–0.48×**
+  (slower than serial, with the t=16<t=8 inversion), the densest dispatch-overhead regime. **A fixed
+  chunk is not enough** — it must scale with `(n,t)`: `dynamic,2048` collapses to 2.97× and
+  `dynamic,16384` to 1.01× at n=100k/t=32 (too few chunks for 32 threads → imbalance/idle), whereas
+  `dynamic,auto` keeps ~8 chunks/thread and holds ~9.7×. This `n/(8t)` adaptivity is the whole reason
+  the task `grainsize` heuristic works, and the worksharing sweep reproduces it exactly.
+- **Static is row-count balanced, *not* nnz-balanced.** This is the crux of the comparison:
+  `schedule(static)` hands each thread an equal number of *rows*, but on the irregular matrix the
+  heavy rows cluster at the top (`§0.2`), so static is **imbalanced** — the heavy block lands on a few
+  threads. `dynamic`/`guided` recover balance by handing out chunks on demand (like the taskloop), at
+  the cost of scheduling overhead that grows as the chunk shrinks. So the expected ordering on the
+  irregular workload is *static (imbalanced) < well-tuned dynamic/guided ≈ tasks*. (The threads
+  version, §1.3, instead pays a one-time **nnz-balanced static** partition and avoids both the
+  imbalance *and* the per-iteration scheduling cost — which is why it is usually the fastest.)
+- **Reduction scoping detail.** Because a worksharing-loop reduction requires the list item to be
+  **shared** in the enclosing parallel, `ss`/`dot_xy` are declared outside the region and listed in
+  `shared(...)`; a `#pragma omp single { ss = 0.0; }` resets the accumulator before each Phase A (a
+  `+` reduction *adds into* the variable's current value). `default(none)` sits on the `parallel`
+  directive (the `for` construct does not accept it), keeping the same data-sharing discipline as §2.6.
+- **Same everything else.** Tag `SPARSE_ITERATION_OMP_WORKSHARING`; identical `rayleigh=`/`checksum=`/
+  `Time (sec) =` output (so `analyze_all.sh` parses it unchanged); correctness within tolerance
+  (verified max |seq − ws| ≈ 1.1e-16 across `static`/`dynamic`/`guided` × t∈{1,2,4,8}). Built with
+  `make omp_ws`; compared against the task version by `scripts/run_omp_ws.sbatch`, whose default
+  `SCHEDULES` span the granularity axis (one version tag per schedule: `omp`, `ws_static`, `ws_guided`,
+  `ws_dynamic`, `ws_dynamic_2048`, `ws_dynamic_16384`, `ws_dynamic_auto`), summarized side by side by
+  `./scripts/analyze_all.sh results_omp_ws`.
+
 ---
 
 ## 3. Variant: dynamic scheduling via the course thread pool — `iterative_SpMV_pool.cpp`
@@ -584,6 +651,13 @@ column exists to *measure* that trade rather than assume it. OpenMP, meanwhile, 
 dynamic structure as the pool in far less code by delegating privatization, reduction, and
 balancing to the runtime.
 
+The optional **work-sharing** OpenMP variant (§2.9) adds a fourth point on this same axis: it keeps the
+OpenMP engine but replaces `taskloop` with `#pragma omp for schedule(runtime)`, so its work
+distribution is whatever `OMP_SCHEDULE` selects. It slots in as `schedule(static)` ≈ a *row-count*
+static partition (imbalanced here, the cautionary case), and `schedule(dynamic|guided)` ≈ the
+taskloop's dynamic balancing without the task-generation step — letting the report separate "dynamic
+vs static balancing" from "tasks vs worksharing as the mechanism," holding everything else fixed.
+
 **Shared invariants** (why all three are comparable at all):
 
 - identical serial initialization → the **same `x₀`** bit-for-bit;
@@ -596,64 +670,26 @@ balancing to the runtime.
 
 ---
 
-## 5. Hybrid MPI + OpenMP — `iterative_SpMV_mpi.cpp`
+## 5. Hybrid MPI + OpenMP — see `docs/MPI_IMPLEMENTATION.md`
 
 The third deliverable adds **distributed memory**: MPI spreads the matrix across processes (ranks,
-possibly on different nodes), and OpenMP parallelizes each rank's share across its cores. It
-reproduces the same algorithm (§0.1) and is grounded in `Code/spmcode11/mpi_power_iteration_partitioned.cpp`
-(power iteration = repeated SpMV + normalize) and the hybrid idioms of `Code/spmcode12/mpi_trapezoid+omp.cpp`.
+possibly on different nodes) and OpenMP parallelizes each rank's share across its cores. It comes in
+two forms — `src/mpi/iterative_SpMV_mpi.cpp` (blocking `Allgatherv` baseline) and
+`src/mpi/iterative_SpMV_mpi_overlap.cpp` (non-blocking `Iallgatherv` with communication/computation
+overlap). Because that deliverable has enough moving parts (the rank-vs-thread geometry, the
+`Scatterv` distribution, the shift-as-rotation, the bit-for-bit correctness property, and the
+non-blocking pipeline), it has its **own dedicated deep-dive: `docs/MPI_IMPLEMENTATION.md`** — read it
+there rather than duplicating it here.
 
-### 5.1 What is distributed, and what is replicated
-
-- **The matrix is distributed by *source* rows** — the same "partition source rows, not output rows"
-  idea as the threads/omp versions (§0.2). The nnz-balanced block each rank owns is **fixed for the
-  whole run**, because the matrix evolution is a circular shift that we apply as a *vector* operation,
-  not a matrix one. This directly answers the sequential header's note that the evolution "must be
-  reflected consistently in the distributed data layout": it is, as a local rotation, so no matrix
-  data ever moves between ranks.
-- **The dense vector `x` is replicated** (full copy on every rank). It is only O(n) (≤4 MB), and the
-  irregular column gather `x[col_idx[p]]` can touch any entry, so every rank needs all of `x`. The
-  big O(nnz) data — the matrix — is what gets distributed.
-
-### 5.2 Setup: rank 0 generates, `MPI_Scatterv` distributes (untimed)
-
-Rank 0 calls the provided `generate_matrix` (deterministic, **untimed** like every version), computes
-the nnz-balanced `boundary[]` partition (the same routine as the threads/NUMA versions) and `Bcast`s
-it. The CSR is then distributed with two `MPI_Scatterv`s: first the per-row nnz counts (each rank
-prefix-sums them into a local, rebased `row_ptr`), then `values` and `col_idx` by nnz blocks. Column
-indices stay **global** (the gather is against the full `x`). Rank 0 frees the full matrix; from then
-on no rank holds it — true memory distribution.
-
-### 5.3 The per-iteration dataflow (one collective)
-
-```
-1. local SpMV (OpenMP):   z_local[i] = Σ_p va[p] · x[col_idx[p]]    for this rank's rows
-2. MPI_Allgatherv(z_local) → full z (natural source order) on every rank
-3. shift as a local rotation:  y[i] = z[(i − shift) mod n]          (= sequential's shifted SpMV)
-4. normalize y in canonical index order → x for the next iteration
-```
-
-`MPI_Init_thread(MPI_THREAD_FUNNELED)` is used because only the main thread calls MPI; the OpenMP
-`parallel for` regions just compute (one matrix row per thread, so each row's accumulation order is
-preserved). The **only collective per iteration is the `Allgatherv`** that rebuilds the full result
-vector — exactly the pattern of the partitioned power-iteration template. Because every rank already
-holds the full vector after the gather, the L2 norm is reduced **locally in canonical index order**
-rather than via a second `MPI_Allreduce`: that costs one fewer collective *and* makes the result
-**bit-for-bit identical to the sequential** (same per-row order, same global reduction order) for any
-rank × thread × node count — so the checksum *matches* the sequential, unlike the threads/omp
-versions whose reduction order differs. (An `Allreduce`-based norm is the more "collective" textbook
-choice and is noted in the code; it would match only within tolerance.)
-
-### 5.4 What is timed, and expected scaling
-
-`MPI_Wtime` brackets the **iterative loop only** (generation + Scatterv are setup, untimed —
-consistent with the project rule and the sequential's timed region); the reported time is the max
-over ranks. The work that scales is the SpMV (O(nnz) split across ranks × threads); the per-iteration
-`Allgatherv` of `x` (O(n)) is the communication that **grows with rank/node count** and, on top of
-the memory-bandwidth ceiling established in the roofline study, is what bounds strong scaling — most
-visibly across nodes. Build with `mpicxx … -fopenmp` (`make mpi`); sweep geometries with
-`scripts/submit_mpi_sweep.sh` (nodes ∈ {1,2,4,8} × rank/thread splits) and summarize with
-`scripts/compare_mpi.sh`.
+In one paragraph: the **matrix is distributed by source rows** (nnz-balanced, fixed for the whole run —
+the evolution is a *vector* rotation, so no matrix data moves) while the **dense vector `x` is
+replicated** (it is O(n) and the irregular gather needs all of it). Rank 0 generates + `MPI_Scatterv`
+distributes the CSR (untimed). Each iteration does a local OpenMP SpMV, **one `Allgatherv`** to rebuild
+the full result vector, a local rotation for the shift, and a **canonical-order** norm — which makes
+the result **bit-for-bit identical to the sequential** (checksum *matches*, unlike threads/omp). The
+overlap variant pipelines the SpMV against a chunked **`MPI_Iallgatherv`** to hide communication.
+Strong scaling is bounded by that per-iteration O(n) `Allgatherv` (grows with node count) on top of the
+memory-bandwidth ceiling from the roofline study.
 
 ## 6. Course grounding
 
@@ -668,11 +704,14 @@ file's header:
 | `parallel → single → taskloop` (OpenMP) | `Code/spmcode9/omp_taskloop.cpp` |
 | `taskloop reduction` for a dot product (OpenMP) | `Code/spmcode9/omp_dotprod_taskloop.cpp` |
 | `taskgroup` + `task_reduction` (the lower-level alternative) | `Code/spmcode9/omp_task_reduction.cpp` |
+| `#pragma omp for` worksharing + `schedule(runtime)`/`OMP_SCHEDULE` + `reduction` (worksharing variant) | SPM NOTES OpenMP worksharing/`schedule`; `Code/spmcode8/jacobi-omp/jacobi-omp.cpp` (single-region `omp for`) |
 | OpenMP affinity via environment | `Code/spmcode8/omp_affinity.cpp` |
 | Single-region iterative loop shape | `Code/spmcode8/jacobi-omp/jacobi-omp.cpp` |
 | Partitioned matrix + `Allgatherv`/`Allreduce` (MPI) | `Code/spmcode11/mpi_power_iteration_partitioned.cpp` |
 | `MPI_Scatterv` block distribution (MPI) | `Code/spmcode11/mpi_vectorsumv.cpp`, `Code/spmcode12/mpi_jacobi_1d_blk.cpp` |
 | Hybrid `MPI_Init_thread(FUNNELED)` + OpenMP loop (MPI+OpenMP) | `Code/spmcode12/mpi_trapezoid+omp.cpp`, `mpi_summa+omp.cpp` |
+| Non-blocking collectives `MPI_Iallgatherv` + `MPI_Wait/Testall` (overlap) | SPM NOTES p.138–139, p.141 ("All collectives have a non-blocking version") |
+| Comm/compute overlap & double buffering (overlap) | SPM NOTES p.140 (async farm skeleton) |
 
 This keeps all three implementations defensible against the project constraint that every
 technique come from the course material.
